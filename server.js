@@ -14,7 +14,48 @@ const PORT = process.env.PORT || 3001;
 // =====================================================
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '25mb' }));
+
+// Basic per-IP throttling for public demo use. Add account-based quota before commercial launch.
+const apiRateLimitStore = new Map();
+const API_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const API_RATE_LIMIT_MAX_REQUESTS = 60;
+
+const apiRequestLimiter = (req, res, next) => {
+  const now = Date.now();
+  const key = req.ip || req.socket?.remoteAddress || 'unknown';
+  let entry = apiRateLimitStore.get(key);
+
+  if (!entry || now - entry.startedAt >= API_RATE_LIMIT_WINDOW_MS) {
+    entry = { startedAt: now, count: 0 };
+  }
+
+  if (entry.count >= API_RATE_LIMIT_MAX_REQUESTS) {
+    return res.status(429).json({
+      error: 'Bạn đã gửi quá nhiều yêu cầu trong thời gian ngắn. Vui lòng chờ một phút rồi thử lại.',
+      quotaExceeded: false,
+    });
+  }
+
+  entry.count += 1;
+  apiRateLimitStore.set(key, entry);
+
+  if (apiRateLimitStore.size > 5000) {
+    for (const [storedIp, storedEntry] of apiRateLimitStore.entries()) {
+      if (now - storedEntry.startedAt >= API_RATE_LIMIT_WINDOW_MS) {
+        apiRateLimitStore.delete(storedIp);
+      }
+    }
+  }
+
+  next();
+};
+
+app.use('/api', (req, res, next) => {
+  if (req.path === '/health') return next();
+  return apiRequestLimiter(req, res, next);
+});
+
 
 // =====================================================
 // MULTER - NHẬN FILE AUDIO
@@ -186,6 +227,61 @@ const getFallbackOpener = (
     safeTopic
   ][safeLevel];
 };
+
+
+// =====================================================
+// GEMINI PROXY FOR THE WEBSITE
+// The API key remains on this server; it is not sent to the browser.
+// =====================================================
+
+const WEBSITE_ALLOWED_MODELS = new Set([
+  'gemini-2.5-flash',
+  'gemini-3.8-flash',
+]);
+
+app.post('/api/gemini/generate', async (req, res) => {
+  try {
+    const { model, contents, config } = req.body || {};
+
+    if (typeof model !== 'string' || !WEBSITE_ALLOWED_MODELS.has(model)) {
+      return res.status(400).json({
+        error: 'Model AI không được phép sử dụng.',
+        quotaExceeded: false,
+      });
+    }
+
+    const hasValidContents =
+      (typeof contents === 'string' && contents.trim().length > 0) ||
+      (Array.isArray(contents) && contents.length > 0);
+
+    if (!hasValidContents) {
+      return res.status(400).json({
+        error: 'Vui lòng cung cấp nội dung cần xử lý.',
+        quotaExceeded: false,
+      });
+    }
+
+    const response = await ai.models.generateContent({
+      model,
+      contents,
+      ...(config && typeof config === 'object' ? { config } : {}),
+    });
+
+    return res.json({
+      text: typeof response.text === 'string' ? response.text : '',
+    });
+  } catch (error) {
+    if (isQuotaError(error)) {
+      return quotaResponse(res, error?.message || '');
+    }
+
+    console.error('❌ Website Gemini proxy error:', error?.message || error);
+    return res.status(502).json({
+      error: 'Backend AI chưa xử lý được yêu cầu. Vui lòng thử lại sau.',
+      quotaExceeded: false,
+    });
+  }
+});
 
 // =====================================================
 // TRANSLATION
@@ -1308,6 +1404,7 @@ app.use(
 
 app.listen(
   PORT,
+  '0.0.0.0',
   () => {
     console.log(
       `\n🚀 Backend đang chạy tại http://localhost:${PORT}`
